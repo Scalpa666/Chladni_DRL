@@ -21,6 +21,7 @@ class QNetwork(nn.Module):
         self.fc1 = nn.Linear(input_size, 128)
         self.fc2 = nn.Linear(128, 64)
         self.fc3 = nn.Linear(64, output_size)
+
     # Define the forward propagation process of the neural network
     def forward(self, x):
         # Apply the ReLU activation function
@@ -57,9 +58,10 @@ class DQNAgent:
 
         self.q_network = QNetwork(state_size, action_size).float()  # 创建 Q 网络
         self.target_network = QNetwork(state_size, action_size).float()  # 创建目标网络
+        self.learning_rate = learning_rate
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=self.learning_rate)  # 优化器
         self.loss_fn = nn.MSELoss()  # 损失函数
-        self.learning_rate = learning_rate
+
 
         self.replay_buffer = ReplayBuffer(10000)  # 经验回放池
         self.batch_size = 528  # 每次训练的批次大小
@@ -138,7 +140,7 @@ def save_results_to_csv(train_list):
     df = pd.DataFrame(train_list, columns=['Episode', 'Action Number', 'Avg Reward', 'Avg_loss', 'Arrival'])
 
     # 判断文件是否存在，如果存在则以附加模式写入（不写入列名）
-    file_path = 'results/train/dqn_training_states.csv'
+    file_path = '../results/train/dqn_training_states.csv'
     if os.path.exists(file_path):
         df.to_csv(file_path, mode='a', header=False, index=False)
     else:
@@ -155,7 +157,7 @@ def save_model(model, optimizer, episode):
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
     }
-    torch.save(checkpoint, f'results/train/dqn_model_checkpoint_{episode}.pth')
+    torch.save(checkpoint, f'../results/train/dqn_model_checkpoint_{episode}.pth')
     print(f"Model saved at episode {episode}.")
 
 
@@ -168,10 +170,10 @@ def load_model(checkpoint_path):
     return state_dict
 
 
-def train_dqn(agent, plate, num_episodes):
+def train_dqn(agent, plate, total_episodes):
     train_states = []
 
-    for episode in range(num_episodes):
+    for episode in range(total_episodes):
         print(f"Current episode: {episode + 1}")
 
         # Generate initial state
@@ -180,14 +182,13 @@ def train_dqn(agent, plate, num_episodes):
         episode_loss = 0
         action_num = 0
         done = False
-        finish = False
+        success = False
 
-        while not finish:
+        while not done:
+            # Predict the action of the current state
             action = agent.act(state)
-            # Done equal to arrival
-            # End when out of bounds or upon arrival
-            next_state, reward, done, finish = plate.play(action)
-            action_num += 1
+            # Done means that it has reached. Finish when out of bounds or upon arrival
+            next_state, reward, done, success = plate.play(action)
 
             # Store experience to replay buffer
             state_1d = state.reshape(-1)
@@ -196,8 +197,11 @@ def train_dqn(agent, plate, num_episodes):
 
             # Train model
             episode_loss += agent.learn()
+            # Update state
             state = next_state
 
+            # Update parameter
+            action_num += 1
             episode_reward += reward
 
             # Update target network
@@ -207,16 +211,16 @@ def train_dqn(agent, plate, num_episodes):
         # Save the states during training
         avg_reward = episode_reward / action_num
         avg_loss = episode_loss / action_num
-        train_states.append([episode, action_num, avg_reward, avg_loss, done])
-        print(f"Episode {episode}/{num_episodes}, Action_num: {action_num}, Avg_reward: {avg_reward}, Avg_loss: {avg_loss}, Arrival: {done}")
+        train_states.append([episode, action_num, avg_reward, avg_loss, success])
+        print(f"Episode {episode}/{total_episodes}, Action_num: {action_num}, Avg_reward: {avg_reward}, Avg_loss: {avg_loss}, Arrival: {success}")
 
         if episode % 1000 == 0:
-            save_model(agent.q_network, agent.optimizer, num_episodes)
+            save_model(agent.q_network, agent.optimizer, total_episodes)
             save_results_to_csv(train_states)
             train_states = []
 
     save_results_to_csv(train_states)
-    save_model(agent.q_network, agent.optimizer, num_episodes)
+    save_model(agent.q_network, agent.optimizer, total_episodes)
 
     return
 
@@ -230,7 +234,7 @@ if __name__ == "__main__":
         print("Using CPU")
 
     # Initialization env
-    data = scipy.io.loadmat('envs/vectorField_RL_2019_P2.mat')
+    data = scipy.io.loadmat('../envs/vectorField_RL_2019_P2.mat')
     env = SimulatedPlate(data)
 
     # Initialize the DQN Agent
@@ -242,7 +246,7 @@ if __name__ == "__main__":
     # agent.load_q_network(state_dict)
 
     # Train DQN
-    train_dqn(agent, env, num_episodes=10000)
+    train_dqn(agent, env, total_episodes=10000)
 
 # 绘制奖励曲线
 # import matplotlib.pyplot as plt

@@ -123,8 +123,8 @@ class SimulatedPlateD:
 
         return reward
 
-    # Step(Action)
-    def play(self, frequency_id):
+    # Play(Action)
+    def step(self, frequency_id):
         """
         Simulate playback function, update particle position
         :param frequency_id: Index of the current frequency

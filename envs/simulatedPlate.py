@@ -114,7 +114,7 @@ class SimulatedPlate:
         # Calculate reward value
         reward = self.reward_function(p_before, delta_p, self.target_p)
 
-        return self.p, reward, self.arrive, self.out | self.arrive
+        return self.p, reward, self.out | self.arrive, self.arrive
 
 
 if __name__ == "__main__":

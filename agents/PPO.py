@@ -1,139 +1,223 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import gym
 from torch.distributions import Categorical
 
-# 创建OpenAI Gym环境
-env = gym.make('CartPole-v1')
+from envs.simulatedPlateD import SimulatedPlateD
 
-# 设置超参数
-lr = 0.0003
-gamma = 0.99
-eps_clip = 0.2
-K_epochs = 4
-batch_size = 64
-update_timestep = 4000
 
-# 神经网络：策略网络和价值网络
-class PPO_Network(nn.Module):
+class PPONetwork(nn.Module):
     def __init__(self, input_dim, output_dim):
-        super(PPO_Network, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, output_dim)  # 策略输出：动作的概率分布
-        self.fc4 = nn.Linear(128, 1)  # 价值函数输出：状态值
+        super(PPONetwork, self).__init__()
+        # Shared base network
+        self.base = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU()
+        )
+        # Policy output: Probability distribution of actions
+        self.logits = nn.Linear(128, output_dim)
+        # Value function output: status value
+        self.value = nn.Linear(128, 1)
 
     def forward(self, state):
-        x = torch.relu(self.fc1(state))
-        x = torch.relu(self.fc2(x))
-        logits = self.fc3(x)  # 动作的logits
-        value = self.fc4(x)  # 状态值
-        return logits, value
+        x = self.base(state)
+        return self.logits(x), self.value(x)
 
-# 创建PPO网络
-input_dim = env.observation_space.shape[0]
-output_dim = env.action_space.n
-policy_net = PPO_Network(input_dim, output_dim)
-optimizer = optim.Adam(policy_net.parameters(), lr=lr)
 
-# 经验回放存储
-class ReplayBuffer:
+class PPOAgent:
+    """PPO Agent implementation"""
+    def __init__(self, state_dim, action_dim):
+        # Hyperparameters
+        self.clip_epsilon = 0.2  # Clipping range
+        self.gamma = 0.99  # Discount factor
+        self.gae_lambda = 0.95  # GAE parameter
+        self.entropy_coeff = 0.01  # Entropy bonus coefficient
+        self.epochs = 4  # Training epochs per update
+        self.batch_size = 64  # Mini-batch size
+
+        self.policy = PPONetwork(state_dim, action_dim)
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=3e-4)
+        self.mse_loss = nn.MSELoss()
+
+    # Select action and return log probability + value
+    def act(self, state):
+        with torch.no_grad():
+            logits, value = self.policy(state)
+            dist = Categorical(logits=logits)
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+        return action.item(), log_prob.item(), value.item()
+
+    # Calculate generalized advantage estimation (GAE)
+    def compute_advantages(self, rewards, values, dones):
+        advantages = []
+        last_advantage = 0
+        next_value = 0
+        next_non_terminal = 0
+
+        # Reverse temporal processing
+        for t in reversed(range(len(rewards))):
+            # Delta is the temporal difference error:
+            delta = rewards[t] + self.gamma * next_value * next_non_terminal - values[t]
+            next_value = values[t]
+            # Compute the GAE
+            advantage = delta + self.gamma * self.gae_lambda * next_non_terminal * last_advantage
+            last_advantage = advantage
+            advantages.insert(0, advantage)
+
+            next_non_terminal = 1 - dones[t]
+        return torch.tensor(advantages, dtype=torch.float32)
+
+    # Update policy using collected experiences
+    def update(self, storage):
+        # Convert storage to tensors
+        states = torch.tensor(storage.states, dtype=torch.float32)
+        actions = torch.tensor(storage.actions, dtype=torch.long)
+        old_log_probs = torch.tensor(storage.log_probs, dtype=torch.float32)
+        returns = torch.tensor(storage.returns, dtype=torch.float32)
+        advantages = torch.tensor(storage.advantages, dtype=torch.float32)
+
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # Train for multiple epochs
+        for _ in range(self.epochs):
+            # Random mini-batch sampling
+            indices = torch.randperm(len(states))
+
+            for start in range(0, len(states), self.batch_size):
+                batch_idx = indices[start:start + self.batch_size]
+
+                # Get batch data
+                batch_states = states[batch_idx]
+                batch_actions = actions[batch_idx]
+                batch_old_log_probs = old_log_probs[batch_idx]
+                batch_returns = returns[batch_idx]
+                batch_advantages = advantages[batch_idx]
+
+                # Calculate new policy
+                logits, values = self.policy(batch_states)
+                dist = Categorical(logits=logits)
+                new_log_probs = dist.log_prob(batch_actions)
+                entropy = dist.entropy().mean()
+
+                # Calculate ratios
+                ratio = (new_log_probs - batch_old_log_probs).exp()
+
+                # Policy loss
+                surr1 = ratio * batch_advantages
+                surr2 = torch.clamp(ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon) * batch_advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                # Value loss
+                value_loss = self.mse_loss(values.squeeze(), batch_returns)
+
+                # Total loss
+                loss = policy_loss + 0.5 * value_loss - self.entropy_coeff * entropy
+
+                # Optimize
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+
+# Experience storage for PPO
+class Storage:
     def __init__(self):
+        self.advantages = None
+        self.returns = None
+        self.values = None
+        self.log_probs = None
+        self.dones = None
+        self.rewards = None
+        self.actions = None
+        self.states = None
+        self.reset()
+
+    def reset(self):
         self.states = []
         self.actions = []
         self.rewards = []
-        self.next_states = []
         self.dones = []
-        self.old_logprobs = []
+        self.log_probs = []
+        self.values = []
+        self.returns = []
+        self.advantages = []
 
-    def clear(self):
-        self.states = []
-        self.actions = []
-        self.rewards = []
-        self.next_states = []
-        self.dones = []
-        self.old_logprobs = []
-
-    def store(self, state, action, reward, next_state, done, old_logprob):
+    # Store experience
+    def store(self, state, action, reward, done, log_prob, value):
         self.states.append(state)
         self.actions.append(action)
         self.rewards.append(reward)
-        self.next_states.append(next_state)
         self.dones.append(done)
-        self.old_logprobs.append(old_logprob)
+        self.log_probs.append(log_prob)
+        self.values.append(value)
 
-    def sample(self):
-        return torch.tensor(self.states, dtype=torch.float32), \
-               torch.tensor(self.actions, dtype=torch.long), \
-               torch.tensor(self.rewards, dtype=torch.float32), \
-               torch.tensor(self.next_states, dtype=torch.float32), \
-               torch.tensor(self.dones, dtype=torch.float32), \
-               torch.tensor(self.old_logprobs, dtype=torch.float32)
+    # Calculate returns and advantages
+    def calculate_returns(self, last_value, gamma=0.99):
+        returns = []
+        advantages = []
+        R = last_value
 
-# 计算GAE
-def compute_gae(rewards, values, next_values, dones, gamma=0.99, lam=0.95):
-    advantages = []
-    gae = 0
-    for i in reversed(range(len(rewards))):
-        delta = rewards[i] + gamma * next_values[i] * (1 - dones[i]) - values[i]
-        gae = delta + gamma * lam * (1 - dones[i]) * gae
-        advantages.insert(0, gae)
-    return advantages
+        # Calculate discounted returns (reverse)
+        for t in reversed(range(len(self.rewards))):
+            R = self.rewards[t] + gamma * R * (1 - self.dones[t])
+            returns.insert(0, R)
 
-# 训练过程
-def train():
-    buffer = ReplayBuffer()
-    running_reward = 0
-    timestep = 0
+        # Store returns and advantages
+        self.returns = returns
+        self.advantages = returns - self.values
 
-    for episode in range(1000):
+    def finalize_trajectory(self, last_value, ppo_agent):
+        """Finalize trajectory and calculate returns/advantages"""
+        # Convert to tensors
+        rewards = torch.tensor(self.rewards, dtype=torch.float32)
+        values = torch.tensor(self.values + [last_value], dtype=torch.float32)  # Add bootstrap value
+        dones = torch.tensor(self.dones, dtype=torch.float32)
+
+        # Calculate GAE advantages
+        advantages = ppo_agent.compute_advantages(rewards, values[:-1], dones, last_value)
+
+        # Calculate returns
+        self.returns = (advantages + values[:-1]).tolist()  # Q = A + V
+
+        # Store advantages
+        self.advantages = advantages.tolist()
+
+
+# Example training loop pseudocode
+def train(agent, env, total_episodes):
+    storage = Storage()
+
+    for episode in range(total_episodes):
+        print(f"Current episode: {episode + 1}")
+
         state = env.reset()
-        episode_reward = 0
         done = False
 
         while not done:
-            state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0)
-            logits, value = policy_net(state_tensor)
-            probs = torch.softmax(logits, dim=-1)
-            dist = Categorical(probs)
-            action = dist.sample()
-            log_prob = dist.log_prob(action)
-
-            next_state, reward, done, _ = env.step(action.item())
-            buffer.store(state, action.item(), reward, next_state, done, log_prob.item())
-
+            action, log_prob, value = agent.act(torch.FloatTensor(state))
+            next_state, reward, done, _ = env.step(action)
+            storage.store(state, action, reward, done, log_prob, value)
             state = next_state
-            episode_reward += reward
-            timestep += 1
 
-            if timestep % update_timestep == 0:
-                states, actions, rewards, next_states, dones, old_logprobs = buffer.sample()
+        # Final value estimation
+        _, _, last_value = agent.act(torch.FloatTensor(state))
+        storage.calculate_returns(last_value)
+        agent.update(storage)
+        storage.reset()
 
-                _, values = policy_net(states)
-                _, next_values = policy_net(next_states)
 
-                advantages = compute_gae(rewards, values.detach(), next_values.detach(), dones)
-                advantages = torch.tensor(advantages, dtype=torch.float32)
+if __name__ == "__main__":
+    total_episodes = 1000
 
-                targets = advantages + values.detach()
+    # The data needed to create env
+    data_path = "displacement_field50.csv"
+    env = SimulatedPlateD(data_path)
 
-                for _ in range(K_epochs):
-                    logits, value = policy_net(states)
-                    dist = Categorical(torch.softmax(logits, dim=-1))
-                    new_logprobs = dist.log_prob(actions)
+    agent = PPOAgent(state_dim=env.state_dimension,
+                     action_dim=env.action_size)
 
-                    ratio = torch.exp(new_logprobs - old_logprobs)
-
-                    surrogate_loss = ratio * advantages
-                    clipped_surrogate_loss = torch.clamp(ratio, 1 - eps_clip, 1 + eps_clip) * advantages
-                    loss = -torch.min(surrogate_loss, clipped_surrogate_loss).mean() + 0.5 * (targets - value).pow(2).mean()
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-
-                buffer.clear()
-
-                running_reward = 0.9
+    train(agent, env, total_episodes)
